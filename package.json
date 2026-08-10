@@ -1,0 +1,30 @@
+{
+  "name": "monitoring-ping",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -k \"next dev\" \"tsx watch src/worker/monitor.ts\"",
+    "build": "next build",
+    "start": "next start",
+    "worker": "tsx src/worker/monitor.ts",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "clsx": "^2.1.1",
+    "concurrently": "^9.2.0",
+    "next": "^16.3.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.13.5",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "eslint": "^9.20.1",
+    "eslint-config-next": "^15.1.6",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3"
+  }
+}

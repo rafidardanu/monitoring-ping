@@ -1,0 +1,4 @@
+controller,nama ap,model ap,mac,ipaddress
+Controller-1,AP Lobby,U6-Lite,AA:BB:CC:DD:EE:01,192.168.1.10
+Controller-1,AP Meeting Room,U6-Pro,AA:BB:CC:DD:EE:02,192.168.1.11
+Controller-2,AP Warehouse,U7-LR,AA:BB:CC:DD:EE:03,192.168.2.10
