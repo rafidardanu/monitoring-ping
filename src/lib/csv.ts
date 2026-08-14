@@ -6,6 +6,13 @@ export type ParsedApCsvRow = {
   model: string;
   mac: string;
   host: string;
+  switchName: string;
+};
+
+export type ParsedSwitchCsvRow = {
+  building: string;
+  name: string;
+  host: string;
 };
 
 const headerAliases: Record<keyof ParsedApCsvRow, string[]> = {
@@ -13,6 +20,13 @@ const headerAliases: Record<keyof ParsedApCsvRow, string[]> = {
   name: ["namaap", "nama", "apname", "name"],
   model: ["modelap", "model", "type"],
   mac: ["mac", "macaddress", "alamatmac"],
+  host: ["ipaddress", "ipaddr", "ipadress", "ip", "host"],
+  switchName: ["switch", "namaswitch", "switchname"]
+};
+
+const switchHeaderAliases: Record<keyof ParsedSwitchCsvRow, string[]> = {
+  building: ["gedung", "building", "lokasi"],
+  name: ["namaswitch", "nama", "switchname", "name"],
   host: ["ipaddress", "ipaddr", "ipadress", "ip", "host"]
 };
 
@@ -124,7 +138,8 @@ export function parseApCsv(text: string): ParsedApCsvRow[] {
       name: row[headerMap.name] ?? "",
       model: row[headerMap.model] ?? "",
       mac: row[headerMap.mac] ?? "",
-      host: row[headerMap.host] ?? ""
+      host: row[headerMap.host] ?? "",
+      switchName: row[headerMap.switchName] ?? ""
     };
 
     return Object.fromEntries(
@@ -138,14 +153,16 @@ export function parseApCsv(text: string): ParsedApCsvRow[] {
         name: getColumnIndex(headerRow, headerAliases.name),
         model: getColumnIndex(headerRow, headerAliases.model),
         mac: getColumnIndex(headerRow, headerAliases.mac),
-        host: getColumnIndex(headerRow, headerAliases.host)
+        host: getColumnIndex(headerRow, headerAliases.host),
+        switchName: getColumnIndex(headerRow, headerAliases.switchName)
       }
     : {
         controller: 0,
         name: 1,
         model: 2,
         mac: 3,
-        host: 4
+        host: 4,
+        switchName: 5
       };
 
   const rows = hasHeaderMatch ? dataRows : table;
@@ -160,4 +177,61 @@ export function parseApCsv(text: string): ParsedApCsvRow[] {
   return parsedRows.filter((row) =>
     Boolean(row.controller && row.name && row.model && row.mac && row.host)
   );
+}
+
+export function parseSwitchCsv(text: string): ParsedSwitchCsvRow[] {
+  const trimmedText = text.trim();
+
+  if (!trimmedText) {
+    throw new Error("CSV kosong");
+  }
+
+  const firstLine = trimmedText.split(/\r?\n/, 1)[0] ?? "";
+  const delimiter = detectDelimiter(firstLine);
+  const table = parseDelimitedText(trimmedText, delimiter);
+
+  if (table.length === 0) {
+    throw new Error("CSV tidak valid");
+  }
+
+  const [headerRow, ...dataRows] = table;
+  const normalizedHeaders = headerRow.map((header) => normalizeHeader(header));
+  const hasHeaderMatch = Object.values(switchHeaderAliases).some((aliases) =>
+    aliases.some((alias) => normalizedHeaders.includes(alias))
+  );
+
+  const parseRow = (row: string[], headerMap: Record<keyof ParsedSwitchCsvRow, number>) => {
+    const record = {
+      building: row[headerMap.building] ?? "",
+      name: row[headerMap.name] ?? "",
+      host: row[headerMap.host] ?? ""
+    };
+
+    return Object.fromEntries(
+      Object.entries(record).map(([key, value]) => [key, value.trim()])
+    ) as ParsedSwitchCsvRow;
+  };
+
+  const headerMap = hasHeaderMatch
+    ? {
+        building: getColumnIndex(headerRow, switchHeaderAliases.building),
+        name: getColumnIndex(headerRow, switchHeaderAliases.name),
+        host: getColumnIndex(headerRow, switchHeaderAliases.host)
+      }
+    : {
+        building: 0,
+        name: 1,
+        host: 2
+      };
+
+  const rows = hasHeaderMatch ? dataRows : table;
+  const parsedRows = rows.map((row, rowIndex) => {
+    if (row.length < 3) {
+      throw new Error(`Baris ${rowIndex + 1} tidak lengkap`);
+    }
+
+    return parseRow(row, headerMap);
+  });
+
+  return parsedRows.filter((row) => Boolean(row.building && row.name && row.host));
 }

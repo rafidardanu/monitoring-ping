@@ -4,13 +4,14 @@ import { deleteAp, setApEnabled, updateAp } from "@/lib/monitoring";
 export async function PATCH(request: Request, context: { params: Promise<{ id: string }> }) {
   const { id } = await context.params;
   const body = (await request.json()) as {
-    enabled?: boolean;
-    controller?: string;
-    name?: string;
-    model?: string;
-    mac?: string;
-    host?: string;
-  };
+      enabled?: boolean;
+      controller?: string;
+      name?: string;
+      model?: string;
+      mac?: string;
+      host?: string;
+      switchId?: number | null;
+    };
 
   if (typeof body.enabled === "boolean") {
     setApEnabled(Number(id), body.enabled);
@@ -31,13 +32,17 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
       );
     }
 
-    updateAp(Number(id), {
-      controller: body.controller,
-      name: body.name,
-      model: body.model,
-      mac: body.mac,
-      host: body.host
-    });
+    updateAp(
+          Number(id),
+          {
+            controller: body.controller,
+            name: body.name,
+            model: body.model,
+            mac: body.mac,
+            host: body.host
+          },
+          body.switchId ?? null
+        );
     return NextResponse.json({ ok: true });
   }
 
