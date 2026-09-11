@@ -752,6 +752,12 @@ select {
   box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.35) inset;
 }
 
+.table-status.online.ongoing {
+  background: var(--online-soft);
+  color: var(--online);
+  box-shadow: 0 0 0 1px rgba(74, 222, 128, 0.35) inset;
+}
+
 .incident-arrow {
   color: var(--muted-dim);
   padding: 0 2px;
@@ -1172,7 +1178,7 @@ select {
 
 .history-row {
   display: grid;
-  grid-template-columns: 40px 1.4fr 130px 130px 100px 190px 90px 90px 80px;
+  grid-template-columns: 30px 1.4fr 130px 110px 150px 190px 90px 90px 80px;
   gap: 12px;
   padding: 10px 12px;
   border-radius: 9px;

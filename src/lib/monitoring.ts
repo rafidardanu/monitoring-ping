@@ -24,7 +24,6 @@ type MonitoringState = {
 };
 
 const monitoringIntervalSeconds = 5;
-const logIntervalMs = 5 * 60 * 1000;
 const dashboardRefreshSeconds = 5;
 const PING_RETRY_ATTEMPTS = 4;
 const PING_RETRY_DELAY_MS = 400;
@@ -40,14 +39,6 @@ function delay(ms: number) {
 
 function formatSqliteTimestamp(date = new Date()) {
   return date.toISOString().replace("T", " ").slice(0, 19);
-}
-
-function shouldWriteLog(lastLoggedAt: string | null | undefined, now = Date.now()) {
-  if (!lastLoggedAt) {
-    return true;
-  }
-
-  return now - parseSqliteTimestamp(lastLoggedAt).getTime() >= logIntervalMs;
 }
 
 function updateApRuntimeState(
@@ -314,13 +305,19 @@ function findOngoingApIncident(apId: number) {
     .get(apId) as { id: number; started_at: string } | undefined;
 }
 
-function openApIncident(apId: number, latencyMs: number | null, message: string | null, checkedAt: string) {
+function openApIncident(
+  apId: number,
+  status: "online" | "offline",
+  latencyMs: number | null,
+  message: string | null,
+  checkedAt: string
+) {
   const db = getDb();
   db.prepare(
     `INSERT INTO ap_logs (ap_id, status, latency_ms, message, checked_at, started_at, ended_at, duration_seconds, incident_status)
-     SELECT ?, 'offline', ?, ?, ?, ?, NULL, NULL, 'ongoing'
+     SELECT ?, ?, ?, ?, ?, ?, NULL, NULL, 'ongoing'
      WHERE NOT EXISTS (SELECT 1 FROM ap_logs WHERE ap_id = ? AND incident_status = 'ongoing')`
-  ).run(apId, latencyMs, message, checkedAt, checkedAt, apId);
+  ).run(apId, status, latencyMs, message, checkedAt, checkedAt, apId);
 }
 
 function touchApIncident(incidentId: number, latencyMs: number | null, message: string | null, checkedAt: string) {
@@ -353,13 +350,19 @@ function findOngoingSwitchIncident(switchId: number) {
     .get(switchId) as { id: number; started_at: string } | undefined;
 }
 
-function openSwitchIncident(switchId: number, latencyMs: number | null, message: string | null, checkedAt: string) {
+function openSwitchIncident(
+  switchId: number,
+  status: "online" | "offline",
+  latencyMs: number | null,
+  message: string | null,
+  checkedAt: string
+) {
   const db = getDb();
   db.prepare(
     `INSERT INTO switch_logs (switch_id, status, latency_ms, message, checked_at, started_at, ended_at, duration_seconds, incident_status)
-     SELECT ?, 'offline', ?, ?, ?, ?, NULL, NULL, 'ongoing'
+     SELECT ?, ?, ?, ?, ?, ?, NULL, NULL, 'ongoing'
      WHERE NOT EXISTS (SELECT 1 FROM switch_logs WHERE switch_id = ? AND incident_status = 'ongoing')`
-  ).run(switchId, latencyMs, message, checkedAt, checkedAt, switchId);
+  ).run(switchId, status, latencyMs, message, checkedAt, checkedAt, switchId);
 }
 
 function touchSwitchIncident(
@@ -723,37 +726,24 @@ async function pingAndRecordAp(ap: ApRecord, now: number) {
 
   updateApRuntimeState(ap.id, status, result.latencyMs, result.message, checkedAt);
 
-  if (status === "offline") {
-    if (previousStatus === "offline") {
-      const ongoing = findOngoingApIncident(ap.id);
-      if (ongoing) {
-        touchApIncident(ongoing.id, result.latencyMs, result.message, checkedAt);
-      } else {
-        openApIncident(ap.id, result.latencyMs, result.message, checkedAt);
-      }
+  if (previousStatus === status) {
+    const ongoing = findOngoingApIncident(ap.id);
+    if (ongoing) {
+      touchApIncident(ongoing.id, result.latencyMs, result.message, checkedAt);
     } else {
-      openApIncident(ap.id, result.latencyMs, result.message, checkedAt);
+      openApIncident(ap.id, status, result.latencyMs, result.message, checkedAt);
     }
     return;
   }
 
-  if (previousStatus === "offline") {
+  if (previousStatus !== null && previousStatus !== undefined) {
     const ongoing = findOngoingApIncident(ap.id);
     if (ongoing) {
       closeApIncident(ongoing.id, ongoing.started_at, checkedAt);
     }
   }
 
-  const runtimeRow = getDb()
-    .prepare("SELECT last_logged_at FROM aps WHERE id = ?")
-    .get(ap.id) as { last_logged_at?: string | null } | undefined;
-
-  if (shouldWriteLog(runtimeRow?.last_logged_at ?? null, now)) {
-    insertLog(ap.id, status, result.latencyMs, result.message, checkedAt);
-    getDb()
-      .prepare("UPDATE aps SET last_logged_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-      .run(checkedAt, ap.id);
-  }
+  openApIncident(ap.id, status, result.latencyMs, result.message, checkedAt);
 }
 
 async function pingAndRecordSwitch(sw: SwitchRecord, now: number) {
@@ -764,37 +754,24 @@ async function pingAndRecordSwitch(sw: SwitchRecord, now: number) {
 
   updateSwitchRuntimeState(sw.id, status, result.latencyMs, result.message, checkedAt);
 
-  if (status === "offline") {
-    if (previousStatus === "offline") {
-      const ongoing = findOngoingSwitchIncident(sw.id);
-      if (ongoing) {
-        touchSwitchIncident(ongoing.id, result.latencyMs, result.message, checkedAt);
-      } else {
-        openSwitchIncident(sw.id, result.latencyMs, result.message, checkedAt);
-      }
+  if (previousStatus === status) {
+    const ongoing = findOngoingSwitchIncident(sw.id);
+    if (ongoing) {
+      touchSwitchIncident(ongoing.id, result.latencyMs, result.message, checkedAt);
     } else {
-      openSwitchIncident(sw.id, result.latencyMs, result.message, checkedAt);
+      openSwitchIncident(sw.id, status, result.latencyMs, result.message, checkedAt);
     }
     return;
   }
 
-  if (previousStatus === "offline") {
+  if (previousStatus !== null && previousStatus !== undefined) {
     const ongoing = findOngoingSwitchIncident(sw.id);
     if (ongoing) {
       closeSwitchIncident(ongoing.id, ongoing.started_at, checkedAt);
     }
   }
 
-  const runtimeRow = getDb()
-    .prepare("SELECT last_logged_at FROM switches WHERE id = ?")
-    .get(sw.id) as { last_logged_at?: string | null } | undefined;
-
-  if (shouldWriteLog(runtimeRow?.last_logged_at ?? null, now)) {
-    insertSwitchLog(sw.id, status, result.latencyMs, result.message, checkedAt);
-    getDb()
-      .prepare("UPDATE switches SET last_logged_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-      .run(checkedAt, sw.id);
-  }
+  openSwitchIncident(sw.id, status, result.latencyMs, result.message, checkedAt);
 }
 
 export async function runMonitoringCycle(options: { force?: boolean } = {}) {

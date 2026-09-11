@@ -1,8 +1,10 @@
 "use client";
 
 import {
+  useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   useTransition,
   type CSSProperties,
@@ -196,7 +198,7 @@ function OverlayShell({
 }
 
 export function DashboardShell() {
-const [data, setData] = useState<DashboardData>({
+  const [data, setData] = useState<DashboardData>({
     monitoring: {
       paused: false,
       monitoringIntervalSeconds: 60,
@@ -221,7 +223,7 @@ const [data, setData] = useState<DashboardData>({
   const [logFrom, setLogFrom] = useState("");
   const [logTo, setLogTo] = useState("");
   const [logController, setLogController] = useState("");
-const [logQuery, setLogQuery] = useState("");
+  const [logQuery, setLogQuery] = useState("");
   const [searchMode, setSearchMode] = useState(false);
   const [selectedStatus, setSelectedStatus] = useState<StatusFilter>("all");
   const [logSource, setLogSource] = useState<LogSource>("ap");
@@ -234,41 +236,57 @@ const [logQuery, setLogQuery] = useState("");
   const [isImporting, setIsImporting] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
 
-  const refresh = async (overrides?: { searchModeOverride?: boolean; sourceOverride?: LogSource }) => {
-    const params = new URLSearchParams();
-    const effectiveSearchMode = overrides?.searchModeOverride ?? searchMode;
-    const effectiveSource = overrides?.sourceOverride ?? logSource;
+  // Menyimpan nilai filter History TERBARU. refresh() selalu membaca dari sini,
+  // bukan langsung dari closure state — supaya interval polling (setInterval)
+  // yang "dipasang" sekali tetap memakai filter terkini di setiap tick,
+  // bukan versi "beku" dari saat interval pertama kali dibuat.
+  const filtersRef = useRef({ logFrom, logTo, logController, searchMode, logSource });
 
-    if (effectiveSearchMode) {
-      params.set("search", "1");
-      if (logFrom) params.set("from", logFrom);
-      if (logTo) params.set("to", logTo);
-      if (logController.trim()) params.set("controller", logController.trim());
+  useEffect(() => {
+    filtersRef.current = { logFrom, logTo, logController, searchMode, logSource };
+  }, [logFrom, logTo, logController, searchMode, logSource]);
+
+  const refresh = useCallback(
+    async (overrides?: { searchModeOverride?: boolean; sourceOverride?: LogSource }) => {
+      const current = filtersRef.current;
+      const params = new URLSearchParams();
+      const effectiveSearchMode = overrides?.searchModeOverride ?? current.searchMode;
+      const effectiveSource = overrides?.sourceOverride ?? current.logSource;
+
+      if (effectiveSearchMode) {
+        params.set("search", "1");
+        if (current.logFrom) params.set("from", current.logFrom);
+        if (current.logTo) params.set("to", current.logTo);
+        if (current.logController.trim()) params.set("controller", current.logController.trim());
+      }
+
+      params.set("source", effectiveSource);
+
+      const response = await fetchJson<ApiResponse<DashboardData>>(`/api/dashboard?${params.toString()}`);
+      setData(response.data);
+    },
+    []
+  );
+
+  const lastUpdatedAt = useMemo(() => {
+    let latest: Date | null = null;
+
+    for (const item of data.summary) {
+      if (!item.checkedAt) {
+        continue;
+      }
+
+      const checkedAt = parseSqliteTimestamp(item.checkedAt);
+      if (!latest || checkedAt.getTime() > latest.getTime()) {
+        latest = checkedAt;
+      }
     }
 
-    params.set("source", effectiveSource);
+    return latest;
+  }, [data.summary]);
 
-    const response = await fetchJson<ApiResponse<DashboardData>>(`/api/dashboard?${params.toString()}`);
-    setData(response.data);
-  };
-
-const lastUpdatedAt = useMemo(() => {
-  let latest: Date | null = null;
-
-  for (const item of data.summary) {
-    if (!item.checkedAt) {
-      continue;
-    }
-
-    const checkedAt = parseSqliteTimestamp(item.checkedAt);
-    if (!latest || checkedAt.getTime() > latest.getTime()) {
-      latest = checkedAt;
-    }
-  }
-
-  return latest;
-}, [data.summary]);
-
+  // Polling berkala — refresh() sudah stabil (useCallback) dan selalu baca
+  // filtersRef.current, jadi interval ini tidak perlu tahu isi filter apapun.
   useEffect(() => {
     void refresh().catch((err: Error) => setError(err.message));
     const timer = window.setInterval(() => {
@@ -276,8 +294,9 @@ const lastUpdatedAt = useMemo(() => {
     }, data.monitoring.dashboardRefreshSeconds * 1000);
 
     return () => window.clearInterval(timer);
-  }, [data.monitoring.dashboardRefreshSeconds, searchMode, logSource]);
+  }, [data.monitoring.dashboardRefreshSeconds, refresh]);
 
+  // Refetch filter, di-debounce 400ms setelah user berhenti mengetik/ganti tanggal.
   useEffect(() => {
     if (!searchMode) {
       return;
@@ -288,7 +307,7 @@ const lastUpdatedAt = useMemo(() => {
     }, 400);
 
     return () => window.clearTimeout(timeout);
-  }, [logController, logFrom, logTo]);
+  }, [logController, logFrom, logTo, refresh]);
 
   useEffect(() => {
     setLogPage(1);
@@ -368,7 +387,7 @@ const lastUpdatedAt = useMemo(() => {
       .sort((left, right) => left.controller.localeCompare(right.controller));
   }, [data.summary]);
 
-    type SwitchGroup = {
+  type SwitchGroup = {
     building: string;
     items: SwitchStatusSummary[];
   };
@@ -402,24 +421,27 @@ const lastUpdatedAt = useMemo(() => {
   );
 
   const filteredLogs = useMemo(() => {
-    if (!searchMode) {
-      return [];
-    }
+      if (!searchMode) {
+        return [];
+      }
 
-    const query = logQuery.trim().toLowerCase();
-    const byStatus = selectedStatus === "all" ? data.logs : data.logs.filter((item) => item.status === selectedStatus);
+      const query = logQuery.trim().toLowerCase();
+      const byStatus = selectedStatus === "all" ? data.logs : data.logs.filter((item) => item.status === selectedStatus);
 
-    if (!query) {
-      return byStatus;
-    }
-
-    return byStatus.filter(
-      (item) =>
-        item.name.toLowerCase().includes(query) ||
-        item.host.toLowerCase().includes(query) ||
-        item.controller.toLowerCase().includes(query)
-    );
-  }, [data.logs, searchMode, selectedStatus, logQuery]);
+      const matched = !query
+        ? byStatus
+        : byStatus.filter(
+            (item) =>
+              item.name.toLowerCase().includes(query) ||
+              item.host.toLowerCase().includes(query) ||
+              item.controller.toLowerCase().includes(query)
+          );
+      return [...matched].sort((a, b) => {
+        const aPriority = a.status === "offline" && a.incident_status === "ongoing" ? 0 : 1;
+        const bPriority = b.status === "offline" && b.incident_status === "ongoing" ? 0 : 1;
+        return aPriority - bPriority;
+      });
+    }, [data.logs, searchMode, selectedStatus, logQuery]);
 
   const logPageCount = searchMode ? Math.max(1, Math.ceil(filteredLogs.length / LOG_PAGE_SIZE)) : 1;
   const currentLogPage = Math.min(logPage, logPageCount);
@@ -575,18 +597,18 @@ const lastUpdatedAt = useMemo(() => {
   };
 
   const beginEdit = (item: ApStatusSummary) => {
-      setError(null);
-      setEditingId(item.id);
-      setForm({
-        controller: item.controller,
-        name: item.name,
-        model: item.model,
-        mac: item.mac,
-        host: item.host,
-        switchId: item.switchId ? String(item.switchId) : ""
-      });
-      setIsApModalOpen(true);
-    };
+    setError(null);
+    setEditingId(item.id);
+    setForm({
+      controller: item.controller,
+      name: item.name,
+      model: item.model,
+      mac: item.mac,
+      host: item.host,
+      switchId: item.switchId ? String(item.switchId) : ""
+    });
+    setIsApModalOpen(true);
+  };
 
   const cancelEdit = () => {
     setEditingId(null);
@@ -623,11 +645,11 @@ const lastUpdatedAt = useMemo(() => {
   };
 
   const openCreateSwitchModal = () => {
-  setError(null);
-  setEditingSwitchId(null);
-  setSwitchForm(initialSwitchForm);
-  setIsSwitchModalOpen(true);
-};
+    setError(null);
+    setEditingSwitchId(null);
+    setSwitchForm(initialSwitchForm);
+    setIsSwitchModalOpen(true);
+  };
 
   const beginEditSwitch = (item: SwitchStatusSummary) => {
     setError(null);
@@ -974,10 +996,7 @@ const lastUpdatedAt = useMemo(() => {
                   {isOpen ? (
                     <div className="ap-list">
                       {group.items.map((item) => (
-                        <div
-                          className={clsx("ap-row", item.enabled !== 1 && "disabled")}
-                          key={item.id}
-                        >
+                        <div className={clsx("ap-row", item.enabled !== 1 && "disabled")} key={item.id}>
                           <div className="ap-main">
                             <div>
                               <div className="ap-name">{item.name}</div>
@@ -1000,7 +1019,10 @@ const lastUpdatedAt = useMemo(() => {
                           <div className="row-actions">
                             <StatusPill status={item.status} paused={paused} disabled={item.enabled !== 1} />
                             {item.enabled === 1 && item.switchStatus === "offline" ? (
-                              <span className="switch-offline-badge" title={`Switch ${item.switchName ?? ""} sedang offline`}>
+                              <span
+                                className="switch-offline-badge"
+                                title={`Switch ${item.switchName ?? ""} sedang offline`}
+                              >
                                 ⚠ Switch offline
                               </span>
                             ) : null}
@@ -1014,11 +1036,7 @@ const lastUpdatedAt = useMemo(() => {
                             >
                               {item.enabled === 1 ? "Disable" : "Enable"}
                             </button>
-                            <button
-                              className="icon-btn danger"
-                              type="button"
-                              onClick={() => void removeAp(item.id)}
-                            >
+                            <button className="icon-btn danger" type="button" onClick={() => void removeAp(item.id)}>
                               Delete
                             </button>
                           </div>
@@ -1164,7 +1182,11 @@ const lastUpdatedAt = useMemo(() => {
                             >
                               {sw.enabled === 1 ? "Disable" : "Enable"}
                             </button>
-                            <button className="icon-btn danger" type="button" onClick={() => void removeSwitch(sw.id)}>
+                            <button
+                              className="icon-btn danger"
+                              type="button"
+                              onClick={() => void removeSwitch(sw.id)}
+                            >
                               Delete
                             </button>
                           </div>
@@ -1205,7 +1227,9 @@ const lastUpdatedAt = useMemo(() => {
 
         <div className="history-toolbar">
           <div className="history-search">
-            <span className="history-search-icon" aria-hidden="true">⌕</span>
+            <span className="history-search-icon" aria-hidden="true">
+              ⌕
+            </span>
             <input
               value={logQuery}
               onChange={(event) => {
@@ -1312,7 +1336,7 @@ const lastUpdatedAt = useMemo(() => {
                 <span>{logSource === "switch" ? "Building" : "Controller"}</span>
                 <span>IP Address</span>
                 <span>Status</span>
-                <span>Since{selectedStatus === "offline" ? " (Offline)" : ""}</span>
+                <span>Since{selectedStatus !== "all" ? ` (${selectedStatus === "online" ? "Online" : "Offline"})` : ""}</span>
                 <span>Duration</span>
                 <span>Latency</span>
                 <span>Action</span>
@@ -1324,7 +1348,7 @@ const lastUpdatedAt = useMemo(() => {
                 </div>
               ) : (
                 pagedLogs.map((item, index) => {
-                  const isIncident = item.status === "offline" && Boolean(item.incident_status);
+                  const isIncident = Boolean(item.incident_status);
                   const isOngoing = item.incident_status === "ongoing";
                   const durationSeconds = !isIncident
                     ? null
@@ -1349,7 +1373,8 @@ const lastUpdatedAt = useMemo(() => {
                       <span className="mono">{item.host}</span>
                       <span>
                         <span className={clsx("table-status", item.status, isOngoing && "ongoing")}>
-                          {isOngoing ? "offline" : item.status}
+                          {item.status}
+                          {isOngoing ? " · ongoing" : ""}
                         </span>
                       </span>
                       <span className="history-since">
@@ -1367,7 +1392,11 @@ const lastUpdatedAt = useMemo(() => {
                       <span className="mono">{isIncident ? formatDuration(durationSeconds ?? 0) : "-"}</span>
                       <span className="mono">{item.latency_ms === null ? "-" : `${item.latency_ms} ms`}</span>
                       <span>
-                        <button className="btn btn-quiet history-view-btn" type="button" onClick={() => showLogDetail(item)}>
+                        <button
+                          className="btn btn-quiet history-view-btn"
+                          type="button"
+                          onClick={() => showLogDetail(item)}
+                        >
                           View
                         </button>
                       </span>
@@ -1380,7 +1409,8 @@ const lastUpdatedAt = useMemo(() => {
             {filteredLogs.length > 0 ? (
               <div className="pagination">
                 <span className="helper-text">
-                  {filteredLogs.length} result{filteredLogs.length === 1 ? "" : "s"} • page {currentLogPage} of {logPageCount}
+                  {filteredLogs.length} result{filteredLogs.length === 1 ? "" : "s"} • page {currentLogPage} of{" "}
+                  {logPageCount}
                 </span>
                 <div className="pagination-controls">
                   <button
