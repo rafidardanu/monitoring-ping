@@ -32,6 +32,7 @@ export type ApStatusSummary = {
 export type ApLogRecord = {
   id: number;
   ap_id: number;
+  enabled: number;
   controller: string;
   name: string;
   model: string;

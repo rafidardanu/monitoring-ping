@@ -45,6 +45,13 @@ type ControllerGroup = {
 
 type StatusFilter = "all" | "online" | "offline";
 type LogSource = "ap" | "switch";
+type LiveDevice = {
+  id: number;
+  name: string;
+  host: string;
+  enabled: number;
+  status: "online" | "offline" | "unknown";
+};
 
 const initialForm: FormState = { controller: "", name: "", model: "", mac: "", host: "", switchId: "" };
 
@@ -62,6 +69,22 @@ const WLC_ACCENTS = ["#5eead4", "#a78bfa", "#fbbf24", "#f472b6", "#60a5fa", "#a3
 
 function wlcAccent(index: number) {
   return WLC_ACCENTS[index % WLC_ACCENTS.length];
+}
+
+function deviceStatusOrder(enabled: number, status: "online" | "offline" | "unknown") {
+  if (enabled !== 1) {
+    return 1;
+  }
+
+  if (status === "offline") {
+    return 0;
+  }
+
+  if (status === "online") {
+    return 2;
+  }
+
+  return 3;
 }
 
 const jakartaTimeFormatter = new Intl.DateTimeFormat("en-US", {
@@ -143,11 +166,13 @@ function SignalBars({ status }: { status: ApStatusSummary["status"] }) {
 function StatusPill({
   status,
   paused = false,
-  disabled = false
+  disabled = false,
+  onClick
 }: {
   status: ApStatusSummary["status"];
   paused?: boolean;
   disabled?: boolean;
+  onClick?: () => void;
 }) {
   if (disabled) {
     return (
@@ -161,7 +186,19 @@ function StatusPill({
   const displayStatus = paused ? "unknown" : status;
 
   return (
-    <span className={clsx("status-pill", displayStatus, paused && "paused")}>
+    <span
+      className={clsx("status-pill", displayStatus, paused && "paused", onClick && "status-pill-clickable")}
+      onClick={onClick}
+      onKeyDown={(event) => {
+        if (onClick && (event.key === "Enter" || event.key === " ")) {
+          event.preventDefault();
+          onClick();
+        }
+      }}
+      role={onClick ? "button" : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      title={onClick ? "Open device history" : undefined}
+    >
       <SignalBars status={displayStatus} />
       {paused ? "paused" : status}
     </span>
@@ -232,19 +269,90 @@ export function DashboardShell() {
   const [pageInputValue, setPageInputValue] = useState("1");
   const [openControllers, setOpenControllers] = useState<Set<string>>(new Set());
   const [openSwitchGroups, setOpenSwitchGroups] = useState<Set<string>>(new Set());
+  const [openHistoryGroups, setOpenHistoryGroups] = useState<Set<string>>(new Set());
   const [isPending, startTransition] = useTransition();
   const [isImporting, setIsImporting] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
+  const [selectedLog, setSelectedLog] = useState<ApLogRecord | null>(null);
+  const [notificationMessage, setNotificationMessage] = useState<string | null>(null);
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | "unsupported">(
+    "default"
+  );
+  const previousDevicesRef = useRef<Map<string, LiveDevice> | null>(null);
+  const historySectionRef = useRef<HTMLElement | null>(null);
+  const pollingRef = useRef(false);
 
   // Menyimpan nilai filter History TERBARU. refresh() selalu membaca dari sini,
   // bukan langsung dari closure state — supaya interval polling (setInterval)
   // yang "dipasang" sekali tetap memakai filter terkini di setiap tick,
   // bukan versi "beku" dari saat interval pertama kali dibuat.
-  const filtersRef = useRef({ logFrom, logTo, logController, searchMode, logSource });
+  const filtersRef = useRef({ logFrom, logTo, logController, logQuery, searchMode, logSource });
 
   useEffect(() => {
-    filtersRef.current = { logFrom, logTo, logController, searchMode, logSource };
-  }, [logFrom, logTo, logController, searchMode, logSource]);
+    filtersRef.current = { logFrom, logTo, logController, logQuery, searchMode, logSource };
+  }, [logFrom, logTo, logController, logQuery, searchMode, logSource]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !("Notification" in window)) {
+      setNotificationPermission("unsupported");
+      return;
+    }
+
+    setNotificationPermission(window.Notification.permission);
+  }, []);
+
+  const reportOfflineTransitions = useCallback((nextData: DashboardData) => {
+    const nextDevices = new Map<string, LiveDevice>();
+    const devices: Array<{ key: string; device: LiveDevice; type: "AP" | "Switch" }> = [
+      ...nextData.summary.map((device) => ({
+        key: `ap-${device.id}`,
+        device: { ...device, status: device.status },
+        type: "AP" as const
+      })),
+      ...nextData.switches.map((device) => ({
+        key: `switch-${device.id}`,
+        device: { ...device, status: device.status },
+        type: "Switch" as const
+      }))
+    ];
+
+    for (const entry of devices) {
+      nextDevices.set(entry.key, entry.device);
+    }
+
+    const previousDevices = previousDevicesRef.current;
+    previousDevicesRef.current = nextDevices;
+
+    if (!previousDevices) {
+      return;
+    }
+
+    const newlyOffline = devices.filter(({ key, device }) => {
+      const previous = previousDevices.get(key);
+      return device.enabled === 1 && device.status === "offline" && previous?.status !== "offline";
+    });
+
+    if (newlyOffline.length === 0) {
+      return;
+    }
+
+    const message =
+      newlyOffline.length === 1
+        ? `${newlyOffline[0].type} ${newlyOffline[0].device.name} (${newlyOffline[0].device.host}) offline`
+        : `${newlyOffline.length} perangkat offline: ${newlyOffline
+            .slice(0, 3)
+            .map(({ device }) => device.name)
+            .join(", ")}${newlyOffline.length > 3 ? "..." : ""}`;
+
+    setNotificationMessage(message);
+
+    if (typeof window !== "undefined" && "Notification" in window && window.Notification.permission === "granted") {
+      new window.Notification("Monitoring: perangkat offline", {
+        body: message,
+        tag: "monitoring-offline"
+      });
+    }
+  }, []);
 
   const refresh = useCallback(
     async (overrides?: { searchModeOverride?: boolean; sourceOverride?: LogSource }) => {
@@ -258,15 +366,36 @@ export function DashboardShell() {
         if (current.logFrom) params.set("from", current.logFrom);
         if (current.logTo) params.set("to", current.logTo);
         if (current.logController.trim()) params.set("controller", current.logController.trim());
+        if (current.logQuery.trim()) params.set("name", current.logQuery.trim());
       }
 
       params.set("source", effectiveSource);
 
       const response = await fetchJson<ApiResponse<DashboardData>>(`/api/dashboard?${params.toString()}`);
+      reportOfflineTransitions(response.data);
       setData(response.data);
     },
-    []
+    [reportOfflineTransitions]
   );
+
+  const enableNotifications = async () => {
+    if (typeof window === "undefined" || !("Notification" in window)) {
+      setNotificationPermission("unsupported");
+      return;
+    }
+
+    const permission = await window.Notification.requestPermission();
+    setNotificationPermission(permission);
+  };
+
+  useEffect(() => {
+    if (!notificationMessage) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => setNotificationMessage(null), 8000);
+    return () => window.clearTimeout(timeout);
+  }, [notificationMessage]);
 
   const lastUpdatedAt = useMemo(() => {
     let latest: Date | null = null;
@@ -285,15 +414,32 @@ export function DashboardShell() {
     return latest;
   }, [data.summary]);
 
-  // Polling berkala — refresh() sudah stabil (useCallback) dan selalu baca
-  // filtersRef.current, jadi interval ini tidak perlu tahu isi filter apapun.
+  // Polling tetap setiap 5 detik, tetapi request yang masih berjalan tidak ditumpuk.
   useEffect(() => {
-    void refresh().catch((err: Error) => setError(err.message));
-    const timer = window.setInterval(() => {
-      void refresh().catch((err: Error) => setError(err.message));
-    }, data.monitoring.dashboardRefreshSeconds * 1000);
+    let cancelled = false;
+    const poll = () => {
+      if (pollingRef.current) {
+        return;
+      }
 
-    return () => window.clearInterval(timer);
+      pollingRef.current = true;
+      void refresh()
+        .catch((err: Error) => {
+        if (!cancelled) {
+          setError(err.message);
+        }
+        })
+        .finally(() => {
+        pollingRef.current = false;
+        });
+    };
+
+    poll();
+    const timer = window.setInterval(poll, data.monitoring.dashboardRefreshSeconds * 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, [data.monitoring.dashboardRefreshSeconds, refresh]);
 
   // Refetch filter, di-debounce 400ms setelah user berhenti mengetik/ganti tanggal.
@@ -307,7 +453,7 @@ export function DashboardShell() {
     }, 400);
 
     return () => window.clearTimeout(timeout);
-  }, [logController, logFrom, logTo, refresh]);
+  }, [logController, logFrom, logTo, logQuery, logSource, searchMode, refresh]);
 
   useEffect(() => {
     setLogPage(1);
@@ -340,31 +486,31 @@ export function DashboardShell() {
   const paused = data.monitoring.paused;
 
   const totals = useMemo(() => {
-    const disabled = data.summary.filter((item) => item.enabled !== 1).length;
-
-    if (paused) {
-      return { online: 0, offline: 0, unknown: data.summary.length, disabled, total: data.summary.length };
+    const counts = { online: 0, offline: 0, unknown: 0, disabled: 0 };
+    for (const item of data.summary) {
+      if (item.enabled !== 1) {
+        counts.disabled += 1;
+      } else if (paused) {
+        counts.unknown += 1;
+      } else {
+        counts[item.status] += 1;
+      }
     }
-
-    const activeSummary = data.summary.filter((item) => item.enabled === 1);
-    const online = activeSummary.filter((item) => item.status === "online").length;
-    const offline = activeSummary.filter((item) => item.status === "offline").length;
-    const unknown = activeSummary.filter((item) => item.status === "unknown").length;
-    return { online, offline, unknown, disabled, total: data.summary.length };
+    return { ...counts, total: data.summary.length };
   }, [data.summary, paused]);
 
   const switchTotals = useMemo(() => {
-    const disabled = data.switches.filter((item) => item.enabled !== 1).length;
-
-    if (paused) {
-      return { online: 0, offline: 0, unknown: data.switches.length, disabled, total: data.switches.length };
+    const counts = { online: 0, offline: 0, unknown: 0, disabled: 0 };
+    for (const item of data.switches) {
+      if (item.enabled !== 1) {
+        counts.disabled += 1;
+      } else if (paused) {
+        counts.unknown += 1;
+      } else {
+        counts[item.status] += 1;
+      }
     }
-
-    const activeSwitches = data.switches.filter((item) => item.enabled === 1);
-    const online = activeSwitches.filter((item) => item.status === "online").length;
-    const offline = activeSwitches.filter((item) => item.status === "offline").length;
-    const unknown = activeSwitches.filter((item) => item.status === "unknown").length;
-    return { online, offline, unknown, disabled, total: data.switches.length };
+    return { ...counts, total: data.switches.length };
   }, [data.switches, paused]);
 
   const sourceTotals = logSource === "switch" ? switchTotals : totals;
@@ -382,7 +528,11 @@ export function DashboardShell() {
     return Array.from(groups.entries())
       .map(([controller, items]) => ({
         controller,
-        items: items.sort((left, right) => left.name.localeCompare(right.name))
+        items: items.sort(
+          (left, right) =>
+            deviceStatusOrder(left.enabled, left.status) - deviceStatusOrder(right.enabled, right.status) ||
+            left.name.localeCompare(right.name)
+        )
       }))
       .sort((left, right) => left.controller.localeCompare(right.controller));
   }, [data.summary]);
@@ -405,7 +555,11 @@ export function DashboardShell() {
     return Array.from(groups.entries())
       .map(([building, items]) => ({
         building,
-        items: items.sort((left, right) => left.name.localeCompare(right.name))
+        items: items.sort(
+          (left, right) =>
+            deviceStatusOrder(left.enabled, left.status) - deviceStatusOrder(right.enabled, right.status) ||
+            left.name.localeCompare(right.name)
+        )
       }))
       .sort((left, right) => left.building.localeCompare(right.building));
   }, [data.switches]);
@@ -436,18 +590,38 @@ export function DashboardShell() {
               item.host.toLowerCase().includes(query) ||
               item.controller.toLowerCase().includes(query)
           );
-      return [...matched].sort((a, b) => {
-        const aPriority = a.status === "offline" && a.incident_status === "ongoing" ? 0 : 1;
-        const bPriority = b.status === "offline" && b.incident_status === "ongoing" ? 0 : 1;
-        return aPriority - bPriority;
-      });
+      return [...matched].sort((a, b) => Date.parse(b.checked_at) - Date.parse(a.checked_at) || b.id - a.id);
     }, [data.logs, searchMode, selectedStatus, logQuery]);
 
-  const logPageCount = searchMode ? Math.max(1, Math.ceil(filteredLogs.length / LOG_PAGE_SIZE)) : 1;
+  const ongoingLogs = useMemo(
+    () =>
+      filteredLogs
+        .filter((item) => item.incident_status === "ongoing")
+        .sort(
+          (left, right) =>
+            deviceStatusOrder(left.enabled, left.status) - deviceStatusOrder(right.enabled, right.status) ||
+            Date.parse(right.checked_at) - Date.parse(left.checked_at) ||
+            right.id - left.id
+        ),
+    [filteredLogs]
+  );
+  const resolvedLogs = useMemo(
+    () => filteredLogs.filter((item) => item.incident_status !== "ongoing"),
+    [filteredLogs]
+  );
+  const ongoingGroups = useMemo(() => {
+    if (ongoingLogs.length === 0) {
+      return [];
+    }
+
+    return [[logSource === "switch" ? "All Switch" : "All AP", ongoingLogs] as const];
+  }, [logSource, ongoingLogs]);
+
+  const logPageCount = searchMode ? Math.max(1, Math.ceil(resolvedLogs.length / LOG_PAGE_SIZE)) : 1;
   const currentLogPage = Math.min(logPage, logPageCount);
   const pagedLogs = searchMode
-    ? filteredLogs.slice((currentLogPage - 1) * LOG_PAGE_SIZE, currentLogPage * LOG_PAGE_SIZE)
-    : filteredLogs;
+    ? resolvedLogs.slice((currentLogPage - 1) * LOG_PAGE_SIZE, currentLogPage * LOG_PAGE_SIZE)
+    : resolvedLogs;
 
   useEffect(() => {
     setPageInputValue(String(currentLogPage));
@@ -515,16 +689,84 @@ export function DashboardShell() {
   };
 
   const showLogDetail = (item: ApLogRecord) => {
-    const lines = [
-      `${item.name} (${item.model})`,
-      `Controller: ${item.controller}`,
-      `IP: ${item.host}`,
-      `Status: ${item.status}`,
-      item.started_at ? `Started: ${formatTimestamp(item.started_at)}` : null,
-      item.ended_at ? `Ended: ${formatTimestamp(item.ended_at)}` : null,
-      item.message ? `Message: ${item.message}` : null
-    ].filter(Boolean);
-    window.alert(lines.join("\n"));
+    setSelectedLog(item);
+  };
+
+  const toggleHistoryGroup = (group: string) => {
+    setOpenHistoryGroups((current) => {
+      const next = new Set(current);
+      if (next.has(group)) next.delete(group);
+      else next.add(group);
+      return next;
+    });
+  };
+
+  const renderHistoryRow = (item: ApLogRecord, index: number, ongoing = false) => {
+    const isIncident = Boolean(item.incident_status);
+    const durationSeconds = !isIncident
+      ? null
+      : ongoing && item.started_at
+        ? (Date.now() - parseSqliteTimestamp(item.started_at).getTime()) / 1000
+        : (item.duration_seconds ?? 0);
+
+    return (
+      <div className={clsx("history-row", `status-${item.status}`, ongoing && "ongoing")} key={item.id}>
+        <span className="history-no">{index + 1}</span>
+        <span className="history-device">
+          <SignalBars status={item.status} />
+          <span className="history-device-text">
+            <span className="history-device-name">{item.name}</span>
+            {item.model && item.model !== "-" ? <span className="history-device-model">{item.model}</span> : null}
+          </span>
+        </span>
+        <span>{item.controller}</span>
+        <span className="mono">{item.host}</span>
+        <span>
+          <span className={clsx("table-status", item.status, ongoing && "ongoing")}>
+            {item.status}{ongoing ? " · ongoing" : ""}
+          </span>
+        </span>
+        <span className="history-since">
+          {isIncident ? (
+            <>
+              <span className="mono">{formatTimestamp(item.started_at ?? item.checked_at)}</span>
+              <span className="history-since-ago">({formatRelative(item.started_at ?? item.checked_at)})</span>
+            </>
+          ) : <span className="mono">{formatTimestamp(item.checked_at)}</span>}
+        </span>
+        <span className="mono">{isIncident ? formatDuration(durationSeconds ?? 0) : "-"}</span>
+        <span className="mono">{item.latency_ms === null ? "-" : `${item.latency_ms} ms`}</span>
+        <span>
+          <button className="btn btn-quiet history-view-btn" type="button" onClick={() => showLogDetail(item)}>
+            View
+          </button>
+        </span>
+      </div>
+    );
+  };
+
+  const openDeviceHistory = async (source: LogSource, name: string) => {
+    const nextFilters = {
+      ...filtersRef.current,
+      logQuery: name,
+      searchMode: true,
+      logSource: source
+    };
+    filtersRef.current = nextFilters;
+    setLogSource(source);
+    setLogQuery(name);
+    setSearchMode(true);
+    setSelectedStatus("all");
+    setLogPage(1);
+
+    try {
+      await refresh({ searchModeOverride: true, sourceOverride: source });
+      window.requestAnimationFrame(() => {
+        historySectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load device history");
+    }
   };
 
   const clearHistoryFilters = () => {
@@ -800,17 +1042,6 @@ export function DashboardShell() {
     setIsSwitchImportModalOpen(false);
   };
 
-  const runNow = async () => {
-    setError(null);
-    setIsBusy(true);
-    try {
-      await fetchJson("/api/monitor/run", { method: "POST" });
-      await refresh();
-    } finally {
-      setIsBusy(false);
-    }
-  };
-
   const toggleRun = async () => {
     setError(null);
     setIsBusy(true);
@@ -881,9 +1112,11 @@ export function DashboardShell() {
         </div>
 
         <div className="toolbar">
-          <button className="btn btn-primary" onClick={runNow} disabled={isBusy} type="button">
-            Run now
-          </button>
+          {notificationPermission === "default" ? (
+            <button className="btn btn-ghost" onClick={() => void enableNotifications()} type="button">
+              Enable notifications
+            </button>
+          ) : null}
           <button className="btn" type="button" onClick={toggleRun} disabled={isBusy}>
             {paused ? "Resume" : "Pause"}
           </button>
@@ -893,42 +1126,26 @@ export function DashboardShell() {
         </div>
       </header>
 
-      <section className="stats-grid">
-        <article className="panel stat-card">
-          <div>
-            <span>Total APs</span>
-            <strong>{totals.total}</strong>
-          </div>
-        </article>
-        <article className="panel stat-card online">
-          <div>
-            <span>Online</span>
-            <strong>{totals.online}</strong>
-          </div>
-          <span className="stat-dot" aria-hidden="true" />
-        </article>
-        <article className="panel stat-card offline">
-          <div>
-            <span>Offline</span>
-            <strong>{totals.offline}</strong>
-          </div>
-          <span className="stat-dot" aria-hidden="true" />
-        </article>
-        <article className="panel stat-card unknown">
-          <div>
-            <span>{paused ? "Paused" : "Unknown"}</span>
-            <strong>{totals.unknown}</strong>
-          </div>
-          <span className="stat-dot" aria-hidden="true" />
-        </article>
-        <article className="panel stat-card disabled">
-          <div>
-            <span>Disabled</span>
-            <strong>{totals.disabled}</strong>
-          </div>
-          <span className="stat-dot" aria-hidden="true" />
-        </article>
-      </section>
+      {notificationMessage ? (
+        <div className="notification-banner" role="alert">
+          <span className="notification-icon" aria-hidden="true">
+            !
+          </span>
+          <span>
+            <strong>Perangkat offline</strong>
+            <br />
+            {notificationMessage}
+          </span>
+          <button
+            className="notification-close"
+            type="button"
+            onClick={() => setNotificationMessage(null)}
+            aria-label="Tutup notifikasi"
+          >
+            ×
+          </button>
+        </div>
+      ) : null}
 
       {importMessage ? <p className="inline-note has-message">{importMessage}</p> : null}
 
@@ -950,6 +1167,14 @@ export function DashboardShell() {
           </div>
         </div>
 
+        <div className="compact-stats" aria-label="AP status summary">
+          <span className="compact-stat total"><b>{totals.total}</b> AP</span>
+          <span className="compact-stat offline"><i />{totals.offline} offline</span>
+          <span className="compact-stat disabled"><i />{totals.disabled} disabled</span>
+          <span className="compact-stat online"><i />{totals.online} online</span>
+          <span className="compact-stat unknown"><i />{totals.unknown} {paused ? "paused" : "unknown"}</span>
+        </div>
+
         <div className="group-list">
           {groupedControllers.length === 0 ? (
             <p className="empty-state">No APs yet — add one or import a CSV to get started.</p>
@@ -960,6 +1185,9 @@ export function DashboardShell() {
               const activeItems = group.items.filter((item) => item.enabled === 1);
               const onlineCount = paused ? 0 : activeItems.filter((item) => item.status === "online").length;
               const offlineCount = paused ? 0 : activeItems.filter((item) => item.status === "offline").length;
+              const unknownCount = paused
+                ? activeItems.length
+                : activeItems.filter((item) => item.status === "unknown").length;
               const disabledCount = group.items.filter((item) => item.enabled !== 1).length;
 
               return (
@@ -979,13 +1207,16 @@ export function DashboardShell() {
                       <h3 className="mono">{group.controller}</h3>
                     </span>
                     <span className="controller-summary">
-                      <span className="status-chip">{group.items.length} AP</span>
-                      <span className="status-chip online-chip">{onlineCount} online</span>
+                      <span className="status-chip summary-total">{group.items.length} AP</span>
                       {offlineCount > 0 ? (
                         <span className="status-chip offline-chip">{offlineCount} offline</span>
                       ) : null}
                       {disabledCount > 0 ? (
                         <span className="status-chip disabled-chip">{disabledCount} disabled</span>
+                      ) : null}
+                      <span className="status-chip online-chip">{onlineCount} online</span>
+                      {unknownCount > 0 ? (
+                        <span className="status-chip unknown-chip">{unknownCount} unknown</span>
                       ) : null}
                       <span className="chevron" aria-hidden="true">
                         ⌄
@@ -1017,7 +1248,12 @@ export function DashboardShell() {
                           </div>
 
                           <div className="row-actions">
-                            <StatusPill status={item.status} paused={paused} disabled={item.enabled !== 1} />
+                            <StatusPill
+                              status={item.status}
+                              paused={paused}
+                              disabled={item.enabled !== 1}
+                              onClick={() => void openDeviceHistory("ap", item.name)}
+                            />
                             {item.enabled === 1 && item.switchStatus === "offline" ? (
                               <span
                                 className="switch-offline-badge"
@@ -1051,43 +1287,6 @@ export function DashboardShell() {
         </div>
       </section>
 
-      <section className="stats-grid">
-        <article className="panel stat-card">
-          <div>
-            <span>Total Switches</span>
-            <strong>{switchTotals.total}</strong>
-          </div>
-        </article>
-        <article className="panel stat-card online">
-          <div>
-            <span>Online</span>
-            <strong>{switchTotals.online}</strong>
-          </div>
-          <span className="stat-dot" aria-hidden="true" />
-        </article>
-        <article className="panel stat-card offline">
-          <div>
-            <span>Offline</span>
-            <strong>{switchTotals.offline}</strong>
-          </div>
-          <span className="stat-dot" aria-hidden="true" />
-        </article>
-        <article className="panel stat-card unknown">
-          <div>
-            <span>{paused ? "Paused" : "Unknown"}</span>
-            <strong>{switchTotals.unknown}</strong>
-          </div>
-          <span className="stat-dot" aria-hidden="true" />
-        </article>
-        <article className="panel stat-card disabled">
-          <div>
-            <span>Disabled</span>
-            <strong>{switchTotals.disabled}</strong>
-          </div>
-          <span className="stat-dot" aria-hidden="true" />
-        </article>
-      </section>
-
       <section className="panel block">
         <div className="block-head">
           <div>
@@ -1106,6 +1305,14 @@ export function DashboardShell() {
           </div>
         </div>
 
+        <div className="compact-stats" aria-label="Switch status summary">
+          <span className="compact-stat total"><b>{switchTotals.total}</b> switch</span>
+          <span className="compact-stat offline"><i />{switchTotals.offline} offline</span>
+          <span className="compact-stat disabled"><i />{switchTotals.disabled} disabled</span>
+          <span className="compact-stat online"><i />{switchTotals.online} online</span>
+          <span className="compact-stat unknown"><i />{switchTotals.unknown} {paused ? "paused" : "unknown"}</span>
+        </div>
+
         {switchImportMessage ? <p className="inline-note has-message">{switchImportMessage}</p> : null}
 
         <div className="group-list">
@@ -1118,6 +1325,9 @@ export function DashboardShell() {
               const activeItems = group.items.filter((item) => item.enabled === 1);
               const onlineCount = paused ? 0 : activeItems.filter((item) => item.status === "online").length;
               const offlineCount = paused ? 0 : activeItems.filter((item) => item.status === "offline").length;
+              const unknownCount = paused
+                ? activeItems.length
+                : activeItems.filter((item) => item.status === "unknown").length;
               const disabledCount = group.items.filter((item) => item.enabled !== 1).length;
 
               return (
@@ -1137,13 +1347,16 @@ export function DashboardShell() {
                       <h3 className="mono">{group.building}</h3>
                     </span>
                     <span className="controller-summary">
-                      <span className="status-chip">{group.items.length} switch</span>
-                      <span className="status-chip online-chip">{onlineCount} online</span>
+                      <span className="status-chip summary-total">{group.items.length} switch</span>
                       {offlineCount > 0 ? (
                         <span className="status-chip offline-chip">{offlineCount} offline</span>
                       ) : null}
                       {disabledCount > 0 ? (
                         <span className="status-chip disabled-chip">{disabledCount} disabled</span>
+                      ) : null}
+                      <span className="status-chip online-chip">{onlineCount} online</span>
+                      {unknownCount > 0 ? (
+                        <span className="status-chip unknown-chip">{unknownCount} unknown</span>
                       ) : null}
                       <span className="chevron" aria-hidden="true">
                         ⌄
@@ -1171,7 +1384,12 @@ export function DashboardShell() {
                           </div>
 
                           <div className="row-actions">
-                            <StatusPill status={sw.status} paused={paused} disabled={sw.enabled !== 1} />
+                            <StatusPill
+                              status={sw.status}
+                              paused={paused}
+                              disabled={sw.enabled !== 1}
+                              onClick={() => void openDeviceHistory("switch", sw.name)}
+                            />
                             <button className="icon-btn" type="button" onClick={() => beginEditSwitch(sw)}>
                               Edit
                             </button>
@@ -1201,7 +1419,7 @@ export function DashboardShell() {
         </div>
       </section>
 
-      <section className="panel block history-panel">
+      <section className="panel block history-panel" ref={historySectionRef}>
         <div className="block-head">
           <div>
             <p className="section-label">History</p>
@@ -1281,11 +1499,10 @@ export function DashboardShell() {
             </div>
           </label>
 
-          <button className="btn btn-quiet" type="button" onClick={clearHistoryFilters}>
-            Clear
-          </button>
-
           <div className="history-toolbar-actions">
+            <button className="btn btn-quiet" type="button" onClick={clearHistoryFilters}>
+              Clear
+            </button>
             <button className="btn btn-quiet" type="button" onClick={exportLogsCsv} disabled={filteredLogs.length === 0}>
               Export
             </button>
@@ -1342,67 +1559,44 @@ export function DashboardShell() {
                 <span>Action</span>
               </div>
 
-              {pagedLogs.length === 0 ? (
+              {ongoingLogs.length === 0 && pagedLogs.length === 0 ? (
                 <div className="history-row empty-table">
                   <span>No Data Found.</span>
                 </div>
               ) : (
-                pagedLogs.map((item, index) => {
-                  const isIncident = Boolean(item.incident_status);
-                  const isOngoing = item.incident_status === "ongoing";
-                  const durationSeconds = !isIncident
-                    ? null
-                    : isOngoing && item.started_at
-                      ? (Date.now() - parseSqliteTimestamp(item.started_at).getTime()) / 1000
-                      : (item.duration_seconds ?? 0);
-                  const rowNumber = (currentLogPage - 1) * LOG_PAGE_SIZE + index + 1;
-
-                  return (
-                    <div className={clsx("history-row", `status-${item.status}`, isOngoing && "ongoing")} key={item.id}>
-                      <span className="history-no">{rowNumber}</span>
-                      <span className="history-device">
-                        <SignalBars status={item.status} />
-                        <span className="history-device-text">
-                          <span className="history-device-name">{item.name}</span>
-                          {item.model && item.model !== "-" ? (
-                            <span className="history-device-model">{item.model}</span>
-                          ) : null}
-                        </span>
-                      </span>
-                      <span>{item.controller}</span>
-                      <span className="mono">{item.host}</span>
-                      <span>
-                        <span className={clsx("table-status", item.status, isOngoing && "ongoing")}>
-                          {item.status}
-                          {isOngoing ? " · ongoing" : ""}
-                        </span>
-                      </span>
-                      <span className="history-since">
-                        {isIncident ? (
-                          <>
-                            <span className="mono">{formatTimestamp(item.started_at ?? item.checked_at)}</span>
-                            <span className="history-since-ago">
-                              ({formatRelative(item.started_at ?? item.checked_at)})
-                            </span>
-                          </>
-                        ) : (
-                          <span className="mono">{formatTimestamp(item.checked_at)}</span>
-                        )}
-                      </span>
-                      <span className="mono">{isIncident ? formatDuration(durationSeconds ?? 0) : "-"}</span>
-                      <span className="mono">{item.latency_ms === null ? "-" : `${item.latency_ms} ms`}</span>
-                      <span>
-                        <button
-                          className="btn btn-quiet history-view-btn"
-                          type="button"
-                          onClick={() => showLogDetail(item)}
-                        >
-                          View
-                        </button>
-                      </span>
+                <>
+                  {ongoingGroups.length > 0 ? (
+                    <div className="history-section-block">
+                      <div className="history-section-title">
+                        Ongoing <span className="count">({ongoingLogs.length})</span>
+                      </div>
+                      {ongoingGroups.map(([group, items]) => {
+                        const groupKey = `${logSource}:${group}`;
+                        const expanded = openHistoryGroups.has(groupKey);
+                        return (
+                          <div className="history-group" key={groupKey}>
+                            <button
+                              className="history-group-toggle"
+                              type="button"
+                              onClick={() => toggleHistoryGroup(groupKey)}
+                              aria-expanded={expanded}
+                            >
+                              <span>{expanded ? "▾" : "▸"} {group}</span>
+                              <span className="count">{items.length}</span>
+                            </button>
+                            {expanded ? items.map((item, index) => renderHistoryRow(item, index, true)) : null}
+                          </div>
+                        );
+                      })}
                     </div>
-                  );
-                })
+                  ) : null}
+                  <div className="history-section-title">
+                    Resolved / History <span className="count">({resolvedLogs.length})</span>
+                  </div>
+                  {pagedLogs.map((item, index) =>
+                    renderHistoryRow(item, (currentLogPage - 1) * LOG_PAGE_SIZE + index)
+                  )}
+                </>
               )}
             </div>
 
@@ -1479,6 +1673,65 @@ export function DashboardShell() {
               </button>
             </div>
           </form>
+        </OverlayShell>
+      ) : null}
+
+      {selectedLog ? (
+        <OverlayShell
+          title={selectedLog.status === "offline" ? "Offline incident" : "Ping result"}
+          description={selectedLog.name}
+          onClose={() => setSelectedLog(null)}
+        >
+          <div className="log-detail">
+            <div className={clsx("log-detail-status", selectedLog.status)}>
+              <SignalBars status={selectedLog.status} />
+              <strong>{selectedLog.status}</strong>
+              {selectedLog.incident_status ? <span>· {selectedLog.incident_status}</span> : null}
+            </div>
+            <div className="log-detail-grid">
+              <div>
+                <span>Model</span>
+                <strong>{selectedLog.model || "-"}</strong>
+              </div>
+              <div>
+                <span>{logSource === "switch" ? "Building" : "Controller"}</span>
+                <strong>{selectedLog.controller || "-"}</strong>
+              </div>
+              <div>
+                <span>IP address</span>
+                <strong className="mono">{selectedLog.host}</strong>
+              </div>
+              <div>
+                <span>Latency</span>
+                <strong>{selectedLog.latency_ms === null ? "-" : `${selectedLog.latency_ms} ms`}</strong>
+              </div>
+              <div>
+                <span>Started</span>
+                <strong>{formatTimestamp(selectedLog.started_at ?? selectedLog.checked_at)}</strong>
+              </div>
+              <div>
+                <span>Ended</span>
+                <strong>{selectedLog.ended_at ? formatTimestamp(selectedLog.ended_at) : "Still ongoing"}</strong>
+              </div>
+              <div>
+                <span>Duration</span>
+                <strong>
+                  {selectedLog.incident_status
+                    ? formatDuration(
+                        selectedLog.incident_status === "ongoing" && selectedLog.started_at
+                          ? (Date.now() - parseSqliteTimestamp(selectedLog.started_at).getTime()) / 1000
+                          : (selectedLog.duration_seconds ?? 0)
+                      )
+                    : "-"}
+                </strong>
+              </div>
+              <div>
+                <span>Last checked</span>
+                <strong>{formatRelative(selectedLog.checked_at)}</strong>
+              </div>
+            </div>
+            {selectedLog.message ? <p className="log-detail-message">{selectedLog.message}</p> : null}
+          </div>
         </OverlayShell>
       ) : null}
 

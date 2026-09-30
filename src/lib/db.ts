@@ -77,6 +77,8 @@ function ensureDatabase() {
       CREATE INDEX IF NOT EXISTS idx_aps_enabled ON aps (enabled);
       CREATE INDEX IF NOT EXISTS idx_switch_logs_switch_id_checked_at ON switch_logs (switch_id, checked_at DESC);
       CREATE INDEX IF NOT EXISTS idx_switches_enabled ON switches (enabled);
+      CREATE INDEX IF NOT EXISTS idx_ap_logs_checked_at ON ap_logs (checked_at DESC, id DESC);
+      CREATE INDEX IF NOT EXISTS idx_switch_logs_checked_at ON switch_logs (checked_at DESC, id DESC);
     `);
 
     const columns = database

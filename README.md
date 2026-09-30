@@ -23,6 +23,7 @@ Dashboard pemantauan Access Point (Cisco & Unifi) berbasis Next.js. Setiap AP di
 - **Manajemen AP dari UI** — tambah, edit, aktifkan/nonaktifkan, dan hapus AP langsung dari dashboard.
 - **Import CSV** — impor massal daftar AP dari file CSV.
 - **Kontrol monitoring** — pause/resume worker, jalankan pengecekan manual (Run now), dan hapus seluruh data (Delete all).
+- **Histori tidak dihapus otomatis** — seluruh AP, log, dan insiden disimpan sampai pengguna memilih penghapusan manual.
 
 ## Tech Stack
 
@@ -36,6 +37,10 @@ Dashboard pemantauan Access Point (Cisco & Unifi) berbasis Next.js. Setiap AP di
 ```bash
 npm install
 ```
+
+Project ini membutuhkan Node.js 22 atau lebih baru. `better-sqlite3` adalah native addon; pada
+Windows, `npm ci` normal membutuhkan Visual Studio Build Tools dengan workload **Desktop
+development with C++**.
 
 ## Menjalankan Aplikasi
 
@@ -77,6 +82,8 @@ Hasil pencarian ditampilkan dengan paginasi (20 baris per halaman) beserta navig
 ## Catatan Teknis
 
 - Database tersimpan di `data/monitoring.db` (SQLite).
+- Tidak ada batas ukuran yang menghapus data secara otomatis. Seluruh isi database, termasuk insiden `ongoing` maupun `resolved`, dipertahankan.
+- Housekeeping mingguan hanya membersihkan sampah di luar isi database: checkpoint file WAL/SHM SQLite, log build lama di `.next/dev/logs`, dan garbage object Git melalui `git gc`. Tidak ada baris/tabel database yang dihapus.
 - Seluruh timestamp ditampilkan dalam zona waktu `Asia/Jakarta`.
 - Tombol **Pause/Resume** menghentikan atau melanjutkan siklus ping tanpa menghapus data yang sudah ada.
 - Tombol **Run now** memicu satu siklus pengecekan manual di luar jadwal otomatis.

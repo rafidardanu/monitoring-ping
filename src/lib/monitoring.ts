@@ -25,16 +25,14 @@ type MonitoringState = {
 
 const monitoringIntervalSeconds = 5;
 const dashboardRefreshSeconds = 5;
-const PING_RETRY_ATTEMPTS = 4;
-const PING_RETRY_DELAY_MS = 400;
+const OFFLINE_CONFIRMATION_CHECKS = 3;
+const PING_RETRY_ATTEMPTS = 1;
+const MONITORING_CONCURRENCY = 10;
+const consecutiveFailures = new Map<string, number>();
 
 function parseSqliteTimestamp(value: string) {
   const normalized = value.includes("T") ? value : value.replace(" ", "T");
   return new Date(normalized.endsWith("Z") ? normalized : `${normalized}Z`);
-}
-
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function formatSqliteTimestamp(date = new Date()) {
@@ -112,9 +110,6 @@ async function pingHostWithRetry(host: string): Promise<PingResult> {
 
     lastResult = result;
 
-    if (attempt < PING_RETRY_ATTEMPTS) {
-      await delay(PING_RETRY_DELAY_MS);
-    }
   }
 
   return lastResult!;
@@ -252,19 +247,6 @@ function updateSwitchRuntimeState(
     .run(status, latencyMs, checkedAt, message, switchId);
 }
 
-export function insertSwitchLog(
-  switchId: number,
-  status: "online" | "offline",
-  latencyMs: number | null,
-  message: string | null,
-  checkedAt = formatSqliteTimestamp()
-) {
-  const db = getDb();
-  return db
-    .prepare("INSERT INTO switch_logs (switch_id, status, latency_ms, message, checked_at) VALUES (?, ?, ?, ?, ?)")
-    .run(switchId, status, latencyMs, message, checkedAt);
-}
-
 export function getSwitchStatusSummary(): SwitchStatusSummary[] {
   const db = getDb();
   const rows = db
@@ -281,19 +263,6 @@ export function getSwitchStatusSummary(): SwitchStatusSummary[] {
     .all();
 
   return rows as SwitchStatusSummary[];
-}
-
-export function insertLog(
-  apId: number,
-  status: "online" | "offline",
-  latencyMs: number | null,
-  message: string | null,
-  checkedAt = formatSqliteTimestamp()
-) {
-  const db = getDb();
-  return db
-    .prepare("INSERT INTO ap_logs (ap_id, status, latency_ms, message, checked_at) VALUES (?, ?, ?, ?, ?)")
-    .run(apId, status, latencyMs, message, checkedAt);
 }
 
 function findOngoingApIncident(apId: number) {
@@ -466,6 +435,7 @@ export function getRecentLogs(limit = 50): ApLogRecord[] {
       a.model,
       a.mac,
       a.host,
+      a.enabled,
       l.status,
       l.latency_ms,
       l.message,
@@ -527,6 +497,7 @@ export function getAllLogs(options: LogSearchOptions = {}): ApLogRecord[] {
       a.model,
       a.mac,
       a.host,
+      a.enabled,
       l.status,
       l.latency_ms,
       l.message,
@@ -555,6 +526,7 @@ export function getRecentSwitchLogsAsAp(limit = 50): ApLogRecord[] {
       '-' AS model,
       '' AS mac,
       sw.host,
+      sw.enabled,
       l.status,
       l.latency_ms,
       l.message,
@@ -612,6 +584,7 @@ export function getAllSwitchLogsAsAp(options: LogSearchOptions = {}): ApLogRecor
       '-' AS model,
       '' AS mac,
       sw.host,
+      sw.enabled,
       l.status,
       l.latency_ms,
       l.message,
@@ -630,100 +603,103 @@ export function getAllSwitchLogsAsAp(options: LogSearchOptions = {}): ApLogRecor
 }
 
 export function importApCsv(rows: ParsedApCsvRow[]) {
+  const db = getDb();
+  const findExisting = db.prepare("SELECT id FROM aps WHERE mac = ? OR host = ? LIMIT 1");
+  const findSwitch = db.prepare("SELECT id FROM switches WHERE name = ? COLLATE NOCASE LIMIT 1");
+  const update = db.prepare(
+    `UPDATE aps
+     SET controller = ?, name = ?, model = ?, mac = ?, host = ?, switch_id = COALESCE(?, switch_id), updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`
+  );
+  const insert = db.prepare(
+    `INSERT INTO aps (controller, name, model, mac, host, switch_id)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  );
   let inserted = 0;
   let updated = 0;
 
-  for (const row of rows) {
-    const db = getDb();
+  db.transaction(() => {
+    for (const row of rows) {
     const normalized = normalizeApInput(row);
-    const switchId = resolveSwitchIdByName(row.switchName ?? "");
-    const existing = db
-      .prepare("SELECT id FROM aps WHERE mac = ? OR host = ? LIMIT 1")
-      .get(normalized.mac, normalized.host) as { id: number } | undefined;
+      const trimmedSwitchName = row.switchName?.trim() ?? "";
+      const switchId = trimmedSwitchName
+        ? (findSwitch.get(trimmedSwitchName) as { id: number } | undefined)?.id ?? null
+        : null;
+      const existing = findExisting.get(normalized.mac, normalized.host) as { id: number } | undefined;
 
-    if (existing) {
-      db.prepare(
-        `UPDATE aps
-         SET controller = ?, name = ?, model = ?, mac = ?, host = ?, switch_id = COALESCE(?, switch_id), updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?`
-      ).run(
-        normalized.controller,
-        normalized.name,
-        normalized.model,
-        normalized.mac,
-        normalized.host,
-        switchId,
-        existing.id
-      );
-      updated += 1;
-    } else {
-      db.prepare(
-        `INSERT INTO aps (controller, name, model, mac, host, switch_id)
-         VALUES (?, ?, ?, ?, ?, ?)`
-      ).run(
-        normalized.controller,
-        normalized.name,
-        normalized.model,
-        normalized.mac,
-        normalized.host,
-        switchId
-      );
-      inserted += 1;
+      if (existing) {
+        update.run(
+          normalized.controller,
+          normalized.name,
+          normalized.model,
+          normalized.mac,
+          normalized.host,
+          switchId,
+          existing.id
+        );
+        updated += 1;
+      } else {
+        insert.run(
+          normalized.controller,
+          normalized.name,
+          normalized.model,
+          normalized.mac,
+          normalized.host,
+          switchId
+        );
+        inserted += 1;
+      }
     }
-  }
+  })();
 
   return { inserted, updated };
 }
 
-function resolveSwitchIdByName(name: string): number | null {
-  const trimmed = name.trim();
-  if (!trimmed) {
-    return null;
-  }
-
-  const db = getDb();
-  const row = db
-    .prepare("SELECT id FROM switches WHERE name = ? COLLATE NOCASE LIMIT 1")
-    .get(trimmed) as { id: number } | undefined;
-
-  return row?.id ?? null;
-}
-
 export function importSwitchCsv(rows: ParsedSwitchCsvRow[]) {
+  const db = getDb();
+  const findExisting = db.prepare("SELECT id FROM switches WHERE host = ? LIMIT 1");
+  const update = db.prepare(
+    "UPDATE switches SET building = ?, name = ?, host = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+  );
+  const insert = db.prepare("INSERT INTO switches (building, name, host) VALUES (?, ?, ?)");
   let inserted = 0;
   let updated = 0;
 
-  for (const row of rows) {
-    const db = getDb();
-    const normalized = normalizeSwitchInput(row);
-    const existing = db
-      .prepare("SELECT id FROM switches WHERE host = ? LIMIT 1")
-      .get(normalized.host) as { id: number } | undefined;
+  db.transaction(() => {
+    for (const row of rows) {
+      const normalized = normalizeSwitchInput(row);
+      const existing = findExisting.get(normalized.host) as { id: number } | undefined;
 
-    if (existing) {
-      db.prepare(
-        `UPDATE switches SET building = ?, name = ?, host = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-      ).run(normalized.building, normalized.name, normalized.host, existing.id);
-      updated += 1;
-    } else {
-      db.prepare(`INSERT INTO switches (building, name, host) VALUES (?, ?, ?)`).run(
-        normalized.building,
-        normalized.name,
-        normalized.host
-      );
-      inserted += 1;
+      if (existing) {
+        update.run(normalized.building, normalized.name, normalized.host, existing.id);
+        updated += 1;
+      } else {
+        insert.run(normalized.building, normalized.name, normalized.host);
+        inserted += 1;
+      }
     }
-  }
+  })();
 
   return { inserted, updated };
 }
 
 async function pingAndRecordAp(ap: ApRecord, now: number) {
   const result = await pingHostWithRetry(ap.host);
-  const status = result.success ? "online" : "offline";
   const checkedAt = formatSqliteTimestamp(new Date(now));
-  const previousStatus = ap.current_status;
+  const key = `ap:${ap.id}`;
 
+  if (!result.success) {
+    const failures = (consecutiveFailures.get(key) ?? 0) + 1;
+    consecutiveFailures.set(key, failures);
+    if (failures < OFFLINE_CONFIRMATION_CHECKS) {
+      return;
+    }
+  } else {
+    consecutiveFailures.delete(key);
+  }
+
+  const status = result.success ? "online" : "offline";
+  const previousStatus = ap.current_status;
   updateApRuntimeState(ap.id, status, result.latencyMs, result.message, checkedAt);
 
   if (previousStatus === status) {
@@ -748,10 +724,21 @@ async function pingAndRecordAp(ap: ApRecord, now: number) {
 
 async function pingAndRecordSwitch(sw: SwitchRecord, now: number) {
   const result = await pingHostWithRetry(sw.host);
-  const status = result.success ? "online" : "offline";
   const checkedAt = formatSqliteTimestamp(new Date(now));
-  const previousStatus = sw.current_status;
+  const key = `switch:${sw.id}`;
 
+  if (!result.success) {
+    const failures = (consecutiveFailures.get(key) ?? 0) + 1;
+    consecutiveFailures.set(key, failures);
+    if (failures < OFFLINE_CONFIRMATION_CHECKS) {
+      return;
+    }
+  } else {
+    consecutiveFailures.delete(key);
+  }
+
+  const status = result.success ? "online" : "offline";
+  const previousStatus = sw.current_status;
   updateSwitchRuntimeState(sw.id, status, result.latencyMs, result.message, checkedAt);
 
   if (previousStatus === status) {
@@ -784,13 +771,33 @@ export async function runMonitoringCycle(options: { force?: boolean } = {}) {
   const aps = listApRecords().filter((ap) => ap.enabled === 1);
   const now = Date.now();
 
-  for (const sw of switches) {
-    await pingAndRecordSwitch(sw, now);
-  }
+  const tasks = [
+    ...switches.map((sw) => ({
+      label: `switch ${sw.name} (${sw.host})`,
+      run: () => pingAndRecordSwitch(sw, now)
+    })),
+    ...aps.map((ap) => ({
+      label: `AP ${ap.name} (${ap.host})`,
+      run: () => pingAndRecordAp(ap, now)
+    }))
+  ];
 
-  for (const ap of aps) {
-    await pingAndRecordAp(ap, now);
-  }
+  let nextTask = 0;
+  const worker = async () => {
+    while (nextTask < tasks.length) {
+      const task = tasks[nextTask];
+      nextTask += 1;
+      try {
+        await task.run();
+      } catch (error) {
+        console.error(`[monitor] ${task.label} failed`, error);
+      }
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(MONITORING_CONCURRENCY, tasks.length) }, () => worker())
+  );
 
   return aps.length + switches.length;
 }

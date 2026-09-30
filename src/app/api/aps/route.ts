@@ -21,7 +21,8 @@ export async function POST(request: Request) {
         name: body.name,
         model: body.model,
         mac: body.mac,
-        host: body.host
+        host: body.host,
+        switchName: ""
       },
       body.switchId ?? null
     );
