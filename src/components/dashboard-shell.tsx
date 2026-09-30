@@ -293,7 +293,11 @@ export function DashboardShell() {
   }, [logFrom, logTo, logController, logQuery, searchMode, logSource]);
 
   useEffect(() => {
-    if (typeof window === "undefined" || !("Notification" in window)) {
+    if (
+      typeof window === "undefined" ||
+      !window.isSecureContext ||
+      !("Notification" in window)
+    ) {
       setNotificationPermission("unsupported");
       return;
     }
@@ -379,13 +383,24 @@ export function DashboardShell() {
   );
 
   const enableNotifications = async () => {
-    if (typeof window === "undefined" || !("Notification" in window)) {
+    if (typeof window === "undefined" || !window.isSecureContext) {
+      setNotificationPermission("unsupported");
+      setNotificationMessage("Notifikasi browser membutuhkan HTTPS. Banner offline tetap akan tampil di dashboard.");
+      return;
+    }
+
+    if (!("Notification" in window)) {
       setNotificationPermission("unsupported");
       return;
     }
 
-    const permission = await window.Notification.requestPermission();
-    setNotificationPermission(permission);
+    try {
+      const permission = await window.Notification.requestPermission();
+      setNotificationPermission(permission);
+    } catch {
+      setNotificationPermission("unsupported");
+      setNotificationMessage("Notifikasi browser tidak tersedia pada alamat HTTP ini. Gunakan HTTPS untuk mengaktifkannya.");
+    }
   };
 
   useEffect(() => {
